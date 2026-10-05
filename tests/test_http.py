@@ -540,3 +540,308 @@ def test_correct_unchanged_by_anchored_feature():
         ],
         "total_error": {"numerator": 2, "denominator": 1},
     }
+
+
+# ---------------------------------------------------------------------------
+# 平台段校正 /correct/plateau：正常路径
+# ---------------------------------------------------------------------------
+
+
+def plateau_payload(items, platform, anchors=None):
+    payload = {"observations": items, "platform": platform}
+    if anchors is not None:
+        payload["anchors"] = anchors
+    return payload
+
+
+def test_plateau_basic_response_marks_platform_points():
+    # 平台 ["a","b"] 共享加权均值 2，并拉动 c 之外的邻点一起合并
+    payload = plateau_payload([obs("a", 3), obs("b", 1), obs("c", 2)], ["a", "b"])
+    r = client.post("/correct/plateau", json=payload)
+    assert r.status_code == 200, r.text
+    data = r.json()
+
+    assert data["blocks"] == [
+        {"start_index": 0, "end_index": 2, "mean": {"numerator": 2, "denominator": 1}}
+    ]
+    assert data["fitted"] == [
+        {"id": "a", "fitted": {"numerator": 2, "denominator": 1}, "fixed": False, "platform": True},
+        {"id": "b", "fitted": {"numerator": 2, "denominator": 1}, "fixed": False, "platform": True},
+        {"id": "c", "fitted": {"numerator": 2, "denominator": 1}, "fixed": False, "platform": False},
+    ]
+    assert data["total_error"] == {"numerator": 2, "denominator": 1}
+
+
+def test_plateau_ids_may_be_given_out_of_order():
+    forward = plateau_payload([obs("a", 3), obs("b", 1), obs("c", 2)], ["a", "b"])
+    shuffled = plateau_payload([obs("a", 3), obs("b", 1), obs("c", 2)], ["b", "a"])
+    r1 = client.post("/correct/plateau", json=forward)
+    r2 = client.post("/correct/plateau", json=shuffled)
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert r1.json() == r2.json()
+
+
+def test_plateau_with_anchors_marks_fixed_and_platform():
+    # 左锚点 a=10 把平台 ["b","c"] 的共享值顶到 10
+    payload = plateau_payload(
+        [obs("a", 10), obs("b", 1), obs("c", 2)], ["b", "c"], ["a"]
+    )
+    r = client.post("/correct/plateau", json=payload)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert fitted_values(data) == [Fraction(10)] * 3
+    assert [p["fixed"] for p in data["fitted"]] == [True, False, False]
+    assert [p["platform"] for p in data["fitted"]] == [False, True, True]
+    assert data["blocks"] == [
+        {"start_index": 0, "end_index": 2, "mean": {"numerator": 10, "denominator": 1}}
+    ]
+    assert data["total_error"] == {"numerator": 145, "denominator": 1}
+
+
+def test_plateau_anchor_inside_platform():
+    # 平台内锚点把共享值等式约束到其读数 5
+    payload = plateau_payload(
+        [obs("a", 1), obs("b", 5), obs("c", 9)], ["a", "b", "c"], ["b"]
+    )
+    r = client.post("/correct/plateau", json=payload)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert fitted_values(data) == [Fraction(5)] * 3
+    assert [p["fixed"] for p in data["fitted"]] == [False, True, False]
+    assert [p["platform"] for p in data["fitted"]] == [True, True, True]
+    assert data["total_error"] == {"numerator": 32, "denominator": 1}
+
+
+def test_plateau_empty_anchor_list_accepted():
+    payload = plateau_payload([obs("a", 3), obs("b", 1)], ["a", "b"], [])
+    r = client.post("/correct/plateau", json=payload)
+    assert r.status_code == 200, r.text
+    assert fitted_values(r.json()) == [Fraction(2), Fraction(2)]
+
+
+def test_plateau_covering_all_observations():
+    items = [obs("a", 3), obs("b", 1), obs("c", 2)]
+    r = client.post(
+        "/correct/plateau", json=plateau_payload(items, ["a", "b", "c"])
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert fitted_values(data) == [Fraction(2)] * 3
+    assert all(p["platform"] for p in data["fitted"])
+    assert data["blocks"] == [
+        {"start_index": 0, "end_index": 2, "mean": {"numerator": 2, "denominator": 1}}
+    ]
+
+
+def test_plateau_end_to_end_matches_independent_recomputation():
+    # 与测试内独立的分区枚举神谕交叉核对（HTTP 层）
+    from .oracle import oracle_plateau_fit
+
+    readings = [10, 4, 8, 2, 9, 3]
+    weights = [3, 1, 2, 4, 1, 5]
+    payload = plateau_payload(
+        [obs(f"p{i}", readings[i], weights[i]) for i in range(6)],
+        ["p2", "p3", "p4"],
+        ["p1", "p4"],
+    )
+    r = client.post("/correct/plateau", json=payload)
+    assert r.status_code == 200, r.text
+    data = r.json()
+
+    expected_fitted, expected_error = oracle_plateau_fit(
+        readings, weights, 2, 4, [1, 4]
+    )
+    assert fitted_values(data) == expected_fitted
+    assert Fraction(
+        data["total_error"]["numerator"], data["total_error"]["denominator"]
+    ) == expected_error
+    assert [p["id"] for p in data["fitted"]] == [f"p{i}" for i in range(6)]
+    assert [p["fixed"] for p in data["fitted"]] == [
+        False, True, False, False, True, False,
+    ]
+    assert [p["platform"] for p in data["fitted"]] == [
+        False, False, True, True, True, False,
+    ]
+    # 平台各点共享同一值；块结构与逐点曲线一致
+    assert len({fitted_values(data)[i] for i in (2, 3, 4)}) == 1
+    for block in data["blocks"]:
+        m = Fraction(block["mean"]["numerator"], block["mean"]["denominator"])
+        for i in range(block["start_index"], block["end_index"] + 1):
+            assert fitted_values(data)[i] == m
+
+
+# ---------------------------------------------------------------------------
+# 平台段校正：409 INFEASIBLE_PLATEAU / INFEASIBLE_ANCHORS
+# ---------------------------------------------------------------------------
+
+
+def test_plateau_infeasible_platform_anchors_returns_409():
+    # 平台内锚点 a=1 与 c=3 要求不同值：平台共享值不可满足
+    payload = plateau_payload(
+        [obs("a", 1), obs("b", 2), obs("c", 3)], ["a", "b", "c"], ["a", "c"]
+    )
+    r = client.post("/correct/plateau", json=payload)
+    assert r.status_code == 409, r.text
+    body = r.json()
+    assert body["detail"]["code"] == "INFEASIBLE_PLATEAU"
+    assert body["detail"]["conflict"] == ["a", "c"]
+    # 不发布部分拟合
+    assert "blocks" not in body
+    assert "fitted" not in body
+    assert "total_error" not in body
+
+
+def test_plateau_infeasible_decreasing_anchors_returns_409():
+    # 平台内锚点读数下降：锚点顺序冲突（沿用 INFEASIBLE_ANCHORS 契约）
+    payload = plateau_payload([obs("a", 3), obs("b", 1)], ["a", "b"], ["a", "b"])
+    r = client.post("/correct/plateau", json=payload)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "INFEASIBLE_ANCHORS"
+    assert r.json()["detail"]["conflict"] == ["a", "b"]
+
+    # 平台外锚点下降：报告最早冲突对
+    payload = plateau_payload(
+        [obs("a", 7), obs("b", 1), obs("c", 9), obs("d", 2)],
+        ["b", "c"],
+        ["a", "d"],
+    )
+    r = client.post("/correct/plateau", json=payload)
+    assert r.status_code == 409
+    assert r.json()["detail"]["code"] == "INFEASIBLE_ANCHORS"
+    assert r.json()["detail"]["conflict"] == ["a", "d"]
+
+
+def test_service_usable_after_infeasible_plateau_request():
+    bad = plateau_payload(
+        [obs("a", 1), obs("b", 2), obs("c", 3)], ["a", "b", "c"], ["a", "c"]
+    )
+    assert client.post("/correct/plateau", json=bad).status_code == 409
+
+    # 修正锚点后同端点正常
+    ok = plateau_payload(
+        [obs("a", 1), obs("b", 2), obs("c", 3)], ["a", "b", "c"], ["b"]
+    )
+    r = client.post("/correct/plateau", json=ok)
+    assert r.status_code == 200, r.text
+    assert fitted_values(r.json()) == [Fraction(2)] * 3
+
+    # 旧两个端点不受影响
+    r = client.post("/correct", json=make_payload([obs("a", 3), obs("b", 1)]))
+    assert r.status_code == 200
+    assert fitted_values(r.json()) == [Fraction(2), Fraction(2)]
+    r = client.post(
+        "/correct/anchored",
+        json=anchored_payload([obs("a", 3), obs("b", 1)], ["b"]),
+    )
+    assert r.status_code == 200
+    assert fitted_values(r.json()) == [Fraction(1), Fraction(1)]
+
+
+# ---------------------------------------------------------------------------
+# 平台段校正：422（非法 id、非连续范围、重复锚点、类型错误、未知字段）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # 未知平台 id
+        plateau_payload([obs("a", 1), obs("b", 2)], ["a", "zzz"]),
+        plateau_payload([obs("a", 1), obs("b", 2)], ["zzz", "yyy"]),
+        plateau_payload([obs("a", 1), obs("b", 2)], ["", "a"]),
+        # 重复平台 id
+        plateau_payload([obs("a", 1), obs("b", 2)], ["a", "a"]),
+        # 非连续范围
+        plateau_payload([obs("a", 1), obs("b", 2), obs("c", 3)], ["a", "c"]),
+        plateau_payload(
+            [obs("a", 1), obs("b", 2), obs("c", 3), obs("d", 4)],
+            ["a", "b", "d"],
+        ),
+        # 平台点数不足 / 空列表 / 缺字段
+        plateau_payload([obs("a", 1), obs("b", 2)], ["a"]),
+        plateau_payload([obs("a", 1), obs("b", 2)], []),
+        {"observations": [obs("a", 1), obs("b", 2)]},
+        # 平台类型错误
+        plateau_payload([obs("a", 1), obs("b", 2)], "ab"),
+        plateau_payload([obs("a", 1), obs("b", 2)], [1, 2]),
+        plateau_payload([obs("a", 1), obs("b", 2)], [["a", "b"]]),
+        plateau_payload([obs("a", 1), obs("b", 2)], [None, "a"]),
+        plateau_payload([obs("a", 1), obs("b", 2)], [True, "a"]),
+        # 未知锚点 id / 重复锚点 / 锚点数量越界 / 锚点类型错误
+        plateau_payload([obs("a", 1), obs("b", 2)], ["a", "b"], ["zzz"]),
+        plateau_payload([obs("a", 1), obs("b", 2)], ["a", "b"], ["a", "a"]),
+        plateau_payload(
+            [obs(f"p{i}", i) for i in range(13)],
+            ["p0", "p1"],
+            [f"p{i}" for i in range(13)],
+        ),
+        plateau_payload([obs("a", 1), obs("b", 2)], ["a", "b"], "a"),
+        plateau_payload([obs("a", 1), obs("b", 2)], ["a", "b"], [1]),
+        # 顶层未知字段
+        {**plateau_payload([obs("a", 1), obs("b", 2)], ["a", "b"]), "mode": "x"},
+        # 观测侧违规依旧 422
+        plateau_payload([obs("a", 1), obs("a", 2)], ["a", "a"]),
+        plateau_payload([obs("a", -1), obs("b", 2)], ["a", "b"]),
+        plateau_payload([obs("a", 1, extra=1), obs("b", 2)], ["a", "b"]),
+    ],
+)
+def test_plateau_invalid_payloads_return_422(payload):
+    response = client.post("/correct/plateau", json=payload)
+    assert response.status_code == 422, response.text
+
+
+def test_plateau_malformed_json_422():
+    r = client.post(
+        "/correct/plateau",
+        content="{not valid json",
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 422
+
+
+def test_old_endpoints_unchanged_by_plateau_feature():
+    # 旧两个端点逐字段不变：同一批观测，平台入口的存在不影响其行为
+    payload = make_payload([obs("a", 3), obs("b", 1), obs("c", 2)])
+    r = client.post("/correct", json=payload)
+    assert r.status_code == 200
+    assert r.json() == {
+        "blocks": [
+            {
+                "start_index": 0,
+                "end_index": 2,
+                "mean": {"numerator": 2, "denominator": 1},
+            }
+        ],
+        "fitted": [
+            {"id": "a", "fitted": {"numerator": 2, "denominator": 1}},
+            {"id": "b", "fitted": {"numerator": 2, "denominator": 1}},
+            {"id": "c", "fitted": {"numerator": 2, "denominator": 1}},
+        ],
+        "total_error": {"numerator": 2, "denominator": 1},
+    }
+
+    r = client.post(
+        "/correct/anchored",
+        json=anchored_payload([obs("a", 3), obs("b", 1), obs("c", 2)], ["b"]),
+    )
+    assert r.status_code == 200
+    assert r.json() == {
+        "blocks": [
+            {
+                "start_index": 0,
+                "end_index": 1,
+                "mean": {"numerator": 1, "denominator": 1},
+            },
+            {
+                "start_index": 2,
+                "end_index": 2,
+                "mean": {"numerator": 2, "denominator": 1},
+            },
+        ],
+        "fitted": [
+            {"id": "a", "fitted": {"numerator": 1, "denominator": 1}, "fixed": False},
+            {"id": "b", "fitted": {"numerator": 1, "denominator": 1}, "fixed": True},
+            {"id": "c", "fitted": {"numerator": 2, "denominator": 1}, "fixed": False},
+        ],
+        "total_error": {"numerator": 4, "denominator": 1},
+    }
