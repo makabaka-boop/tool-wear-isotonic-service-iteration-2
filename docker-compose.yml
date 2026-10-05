@@ -1,0 +1,15 @@
+services:
+  api:
+    build: .
+    image: tool-wear-isotonic:latest
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  # 同一镜像内运行 pytest；按需启用：docker compose run --rm tests
+  tests:
+    image: tool-wear-isotonic:latest
+    build: .
+    command: ["python", "-m", "pytest", "-v"]
+    profiles:
+      - test
