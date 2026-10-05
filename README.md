@@ -89,6 +89,68 @@ id 指定 **1～12 个锚点**；锚点的 `fitted` 以**等式约束**恒等于
 }
 ```
 
+### 平台段校正
+
+一段连续加工工位经复测确认处于同一磨损平台时，计量员可要求这些点的
+校正值**完全相等**。`POST /correct/plateau` 以原观测 id 指定平台段，
+并可同时传入现有固定观测（锚点）：
+
+```json
+{
+  "observations": [
+    {"id": "p1", "reading": 10, "weight": 1},
+    {"id": "p2", "reading": 1, "weight": 1},
+    {"id": "p3", "reading": 2, "weight": 1}
+  ],
+  "plateau": ["p2", "p3"],
+  "anchors": []
+}
+```
+
+- `plateau`：至少 **2 个**唯一 id，且必须恰好构成一段**连续区间**
+  （非连续范围、未知 id、重复 id 均返回 **422**）；
+- `anchors`：可省略或为空，规则同 `/correct/anchored`（0～12 个），
+  允许与平台重叠——平台内锚点把平台共同值钉死在其 `reading` 上。
+
+平台内各点共享一个**待求的精确有理数**共同值：求解把平台段坍缩为
+单个超观测（权重 = 段内权重和，读数 = 段内加权均值的精确分数），与
+平台两侧的保序约束、全部锚点等式约束**联合**解出——不是先跑普通
+PAVA 再强行覆盖输出。响应结构同 `/correct/anchored`，逐点用
+`fixed` 标出固定点、用 `plateau` 标出平台成员；分块仍为整条曲线上的
+最大连续等值段——等值跨越平台边界时也合并为同一块：
+
+```json
+{
+  "blocks": [
+    {"start_index": 0, "end_index": 2,
+     "mean": {"numerator": 13, "denominator": 3}}
+  ],
+  "fitted": [
+    {"id": "p1", "fitted": {"numerator": 13, "denominator": 3},
+     "fixed": false, "plateau": false},
+    {"id": "p2", "fitted": {"numerator": 13, "denominator": 3},
+     "fixed": false, "plateau": true},
+    {"id": "p3", "fitted": {"numerator": 13, "denominator": 3},
+     "fixed": false, "plateau": true}
+  ],
+  "total_error": {"numerator": 146, "denominator": 3}
+}
+```
+
+两类不可行均返回 **409** 与稳定的冲突证据，不发布任何部分拟合：
+平台内锚点读数不一致（`INFEASIBLE_PLATEAU`，冲突对为平台内最早
+不一致的两个锚点 id）；锚点读数按观测顺序下降（`INFEASIBLE_ANCHORS`，
+同 `/correct/anchored` 契约）。
+
+```json
+{
+  "detail": {
+    "code": "INFEASIBLE_PLATEAU",
+    "conflict": ["p2", "p3"]
+  }
+}
+```
+
 ## 接口
 
 `POST /correct`，普通 JSON：
@@ -160,12 +222,14 @@ python3.12 -m venv .venv
 
 ```
 app/
-  isotonic.py   # 纯整数/分数 PAVA 与锚点有界拟合（无 float）
+  isotonic.py   # 纯整数/分数 PAVA、锚点有界拟合与平台段归约（无 float）
   schemas.py    # pydantic 请求/响应模型与 422 校验
-  main.py       # FastAPI 路由（/correct、/correct/anchored、/health）
+  main.py       # FastAPI 路由（/correct、/correct/anchored、
+                # /correct/plateau、/health）
 tests/
   test_isotonic.py  # 领域算法测试
   test_anchored.py  # 固定观测校正测试
+  test_plateau.py   # 平台段校正测试
   test_http.py      # HTTP 测试
   oracle.py         # 枚举全部连续分区（2^(n-1) 种）的精确神谕
 pytest.ini / Dockerfile / docker-compose.yml
@@ -189,6 +253,14 @@ pytest.ini / Dockerfile / docker-compose.yml
   假设）；覆盖相等锚点、端点锚点、全固定、跨锚点等值单分块、锚点
   精确固定（非大权重近似）、空锚点与普通拟合逐项一致、最早冲突对
   报告，以及冲突后 `/correct` 与修正后的锚点请求仍可正常调用。
+- 平台段校正：短序列上用**整序列分组枚举神谕**核对最优性——枚举全部
+  连续分区中平台段内无切点的候选（平台各点同块 ⇒ 等值成立），块值取
+  加权均值或锚点读数；覆盖平台在序列两端/覆盖全序列/最小两点平台、
+  平台内锚点钉值、跨平台边界等值合并为最粗分块、联合求解（平台值被
+  邻点拉动而非 PAVA 后覆盖）、无锚点平台与归约 PAVA 一致、两类不可行
+  （平台内锚点矛盾、锚点顺序下降）与神谕"无可行分区"交叉确认，以及
+  非法 id、非连续范围、重复锚点的 422 契约。
 - HTTP：200 响应结构与精确数值、未知字段/重复 id/越界/类型错误/错误
   媒体类型/畸形 JSON 一律 422、未知或重复锚点 422、锚点下降 409
-  （`INFEASIBLE_ANCHORS`）、2 与 5000 个点的边界。
+  （`INFEASIBLE_ANCHORS`）、平台内锚点矛盾 409（`INFEASIBLE_PLATEAU`）、
+  2 与 5000 个点的边界。

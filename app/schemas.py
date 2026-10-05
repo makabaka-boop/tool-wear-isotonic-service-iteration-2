@@ -9,6 +9,12 @@
 固定观测校正（``/correct/anchored``）额外要求：
 * ``anchors`` 以唯一 id 指定 1 至 12 个锚点；
 * 锚点 id 不得重复，且必须存在于本批观测中——违反同样返回 422。
+
+平台段校正（``/correct/plateau``）额外要求：
+* ``plateau`` 以唯一 id 指定至少 2 个观测，且这些观测必须恰好构成
+  一段连续区间（非连续范围整次拒绝）；
+* ``anchors`` 可省略或为空，规则同上（0 至 12 个），允许与平台重叠
+  （平台内锚点把平台共同值钉死在其 reading 上）。
 """
 
 from __future__ import annotations
@@ -29,6 +35,7 @@ MAX_READING = 10**9
 MAX_WEIGHT = 10**6
 MIN_ANCHORS = 1
 MAX_ANCHORS = 12
+MIN_PLATEAU = 2
 
 
 class Observation(BaseModel):
@@ -106,6 +113,64 @@ class AnchoredCorrectionRequest(BaseModel):
         return self
 
 
+def _ensure_unique_strings(value: List[str], what: str) -> List[str]:
+    seen: set[str] = set()
+    for item in value:
+        if item in seen:
+            raise ValueError(f"duplicate {what}: {item!r}")
+        seen.add(item)
+    return value
+
+
+class PlateauCorrectionRequest(BaseModel):
+    """平台段校正请求：观测同 /correct，另以原观测 id 指定平台段。
+
+    ``plateau`` 为至少 2 个唯一 id，必须恰好覆盖一段连续区间；
+    ``anchors`` 可省略或为空（0～12 个唯一 id），允许与平台重叠。
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    observations: List[Observation] = Field(
+        min_length=MIN_OBSERVATIONS, max_length=MAX_OBSERVATIONS
+    )
+    plateau: List[str] = Field(min_length=MIN_PLATEAU)
+    anchors: List[str] = Field(default_factory=list, max_length=MAX_ANCHORS)
+
+    @field_validator("observations")
+    @classmethod
+    def _unique_ids(cls, value: List[Observation]) -> List[Observation]:
+        return _ensure_unique_ids(value)
+
+    @field_validator("plateau")
+    @classmethod
+    def _unique_plateau_ids(cls, value: List[str]) -> List[str]:
+        return _ensure_unique_strings(value, "plateau id")
+
+    @field_validator("anchors")
+    @classmethod
+    def _unique_anchor_ids(cls, value: List[str]) -> List[str]:
+        return _ensure_unique_strings(value, "anchor id")
+
+    @model_validator(mode="after")
+    def _ids_known_and_plateau_contiguous(self) -> "PlateauCorrectionRequest":
+        position_by_id = {
+            item.id: i for i, item in enumerate(self.observations)
+        }
+        positions: List[int] = []
+        for plateau_id in self.plateau:
+            if plateau_id not in position_by_id:
+                raise ValueError(f"unknown plateau id: {plateau_id!r}")
+            positions.append(position_by_id[plateau_id])
+        positions.sort()
+        if positions[-1] - positions[0] != len(positions) - 1:
+            raise ValueError("plateau ids must form a contiguous range")
+        for anchor in self.anchors:
+            if anchor not in position_by_id:
+                raise ValueError(f"unknown anchor id: {anchor!r}")
+        return self
+
+
 class FractionModel(BaseModel):
     """不可约分数。"""
 
@@ -161,4 +226,25 @@ class AnchoredCorrectionResponse(BaseModel):
 
     blocks: List[BlockModel]
     fitted: List[AnchoredFittedPoint]
+    total_error: FractionModel
+
+
+class PlateauFittedPoint(BaseModel):
+    """逐点拟合结果；``fixed`` 标出固定点，``plateau`` 标出平台段成员。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    fitted: FractionModel
+    fixed: bool
+    plateau: bool
+
+
+class PlateauCorrectionResponse(BaseModel):
+    """平台段校正结果：结构同 /correct，逐点标出固定点与平台成员。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    blocks: List[BlockModel]
+    fitted: List[PlateauFittedPoint]
     total_error: FractionModel

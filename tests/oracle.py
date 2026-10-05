@@ -254,3 +254,81 @@ def oracle_anchored_fit_whole(
 
     assert best_values is not None and best_error is not None
     return best_values, best_error
+
+
+def oracle_plateau_fit_whole(
+    readings: Sequence[int],
+    weights: Sequence[int],
+    plateau_positions: Sequence[int],
+    anchor_positions: Sequence[int] = (),
+) -> Tuple[List[Fraction] | None, Fraction | None]:
+    """平台段校正的整序列暴力枚举神谕：不做超观测归约、不做段分解。
+
+    枚举全部 2^(n-1) 个连续分区，只保留平台段 [p, q] 内部无切点的分区
+    （平台各点落在同一块 ⇒ 等值约束成立）；含锚点的块强制取锚点读数
+    （同块含不同读数的锚点则该分区不可行），其余块取块内加权均值；
+    过滤块值非递减的可行候选，取误差最小者。与求解器不共享任何结构
+    假设（最优块值必为块内加权均值或锚点值，故枚举穷尽全部最优候选；
+    目标严格凸 ⇒ 最优曲线唯一）。
+
+    返回（逐点 fitted，总误差）；没有任何可行分区（问题不可行）时返回
+    (None, None)。
+    """
+
+    n = len(readings)
+    first = min(plateau_positions)
+    last = max(plateau_positions)
+    anchor_set = set(anchor_positions)
+    best_values: List[Fraction] | None = None
+    best_error: Fraction | None = None
+    for mask in _cut_masks(n):
+        # 平台段内不得有切点：平台各点必须落在同一块
+        if any(mask & (1 << i) for i in range(first, last)):
+            continue
+        ranges: List[Tuple[int, int]] = []
+        start = 0
+        for i in range(n - 1):
+            if mask & (1 << i):
+                ranges.append((start, i))
+                start = i + 1
+        ranges.append((start, n - 1))
+
+        values: List[Fraction] = []
+        feasible = True
+        prev: Fraction | None = None
+        for block_start, block_end in ranges:
+            block_anchors = [
+                i for i in range(block_start, block_end + 1) if i in anchor_set
+            ]
+            if block_anchors:
+                value = Fraction(readings[block_anchors[0]])
+                if any(
+                    readings[i] != readings[block_anchors[0]]
+                    for i in block_anchors
+                ):
+                    feasible = False
+                    break
+            else:
+                sw = sum(weights[block_start : block_end + 1])
+                swr = sum(
+                    weights[j] * readings[j]
+                    for j in range(block_start, block_end + 1)
+                )
+                value = Fraction(swr, sw)
+            if prev is not None and value < prev:
+                feasible = False
+                break
+            prev = value
+            values.extend([value] * (block_end - block_start + 1))
+        if not feasible:
+            continue
+
+        error = sum(
+            (weights[i] * (values[i] - readings[i]) ** 2 for i in range(n)),
+            Fraction(0, 1),
+        )
+        if best_error is None or error < best_error:
+            best_error = error
+            best_values = values
+
+    return best_values, best_error

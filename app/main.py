@@ -7,8 +7,10 @@ from fastapi import FastAPI, HTTPException
 from .isotonic import (
     FitResult,
     InfeasibleAnchorsError,
+    InfeasiblePlateauError,
     fit_isotonic,
     fit_isotonic_anchored,
+    fit_isotonic_plateau,
 )
 from .schemas import (
     AnchoredCorrectionRequest,
@@ -19,6 +21,9 @@ from .schemas import (
     CorrectionResponse,
     FittedPoint,
     FractionModel,
+    PlateauCorrectionRequest,
+    PlateauCorrectionResponse,
+    PlateauFittedPoint,
 )
 
 app = FastAPI(
@@ -112,6 +117,70 @@ def correct_anchored(
         for i in range(len(observations))
     ]
     return AnchoredCorrectionResponse(
+        blocks=_block_models(result),
+        fitted=fitted,
+        total_error=FractionModel(
+            numerator=result.total_error_num,
+            denominator=result.total_error_den,
+        ),
+    )
+
+
+@app.post("/correct/plateau", response_model=PlateauCorrectionResponse)
+def correct_plateau(
+    request: PlateauCorrectionRequest,
+) -> PlateauCorrectionResponse:
+    observations = request.observations
+    readings = [o.reading for o in observations]
+    weights = [o.weight for o in observations]
+    position_by_id = {o.id: i for i, o in enumerate(observations)}
+    plateau_positions = [position_by_id[item] for item in request.plateau]
+    anchor_positions = [position_by_id[anchor] for anchor in request.anchors]
+
+    try:
+        result = fit_isotonic_plateau(
+            readings, weights, plateau_positions, anchor_positions
+        )
+    except InfeasiblePlateauError as exc:
+        # 平台内锚点读数不一致：等式约束互相矛盾，不发布部分拟合
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "INFEASIBLE_PLATEAU",
+                "conflict": [
+                    observations[exc.left].id,
+                    observations[exc.right].id,
+                ],
+            },
+        ) from exc
+    except InfeasibleAnchorsError as exc:
+        # 锚点读数按观测顺序下降：等式约束不可满足，不发布部分拟合
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "INFEASIBLE_ANCHORS",
+                "conflict": [
+                    observations[exc.left].id,
+                    observations[exc.right].id,
+                ],
+            },
+        ) from exc
+
+    fixed_positions = set(anchor_positions)
+    plateau_position_set = set(plateau_positions)
+    fitted = [
+        PlateauFittedPoint(
+            id=observations[i].id,
+            fitted=FractionModel(
+                numerator=result.fitted_num[i],
+                denominator=result.fitted_den[i],
+            ),
+            fixed=i in fixed_positions,
+            plateau=i in plateau_position_set,
+        )
+        for i in range(len(observations))
+    ]
+    return PlateauCorrectionResponse(
         blocks=_block_models(result),
         fitted=fitted,
         total_error=FractionModel(
